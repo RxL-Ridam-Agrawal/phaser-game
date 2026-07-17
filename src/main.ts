@@ -1,5 +1,6 @@
 import Phaser from 'phaser';
 import MainScene from './scenes/MainScene/MainScene';
+import PastureScene from './scenes/PastureScene/PastureScene';
 
 const config: Phaser.Types.Core.GameConfig = {
   type: Phaser.AUTO,
@@ -14,7 +15,8 @@ const config: Phaser.Types.Core.GameConfig = {
       debug: false,
     },
   },
-  scene: [MainScene],
+  // The first scene in the list is the one that starts automatically.
+  scene: [MainScene, PastureScene],
 };
 
 export default new Phaser.Game(config);

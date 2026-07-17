@@ -1,19 +1,30 @@
 import Phaser from 'phaser';
 
-// Renders the Sprite Fusion map from public/assets/map.
-// Left/right arrows run the player; the camera follows.
-// Layers marked with the `collider: true`
-// property in Tiled are collected in `collisionLayers`, ready to be
-// used with this.physics.add.collider(player, layer) later.
+// Renders the Sprite Fusion map from public/assets/map. The tileset image
+// (spritesheet.png) is composed from Tiny Swords (Free Pack) art, so the
+// map keeps its original layout but wears the Tiny Swords look.
+//
+// Controls: arrow keys move in all four directions (top-down), SPACE hops,
+// X swings the axe. Layers marked with the `collider: true` property are
+// solid.
 export default class MainScene extends Phaser.Scene {
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
+  private attackKey!: Phaser.Input.Keyboard.Key;
   private collisionLayers: (Phaser.Tilemaps.TilemapLayer | Phaser.Tilemaps.TilemapGPULayer)[] = [];
   private player!: Phaser.Types.Physics.Arcade.SpriteWithDynamicBody;
+  private isAttacking = false;
+  private isJumping = false;
 
-  // On-screen character height in px (2 tiles). The idle and walk sheets have
-  // different frame resolutions (303x512 vs 170x238), so scale is derived per
-  // animation to keep the character the same size when switching between them.
-  private static readonly PLAYER_DISPLAY_HEIGHT = 128;
+  // Pawn frames are 192x192 with large transparent padding; the character
+  // itself is ~50x70 px around the frame centre (feet at y~134). Drawn at
+  // native scale to match the Tiny Swords map art.
+  private static readonly PAWN_FRAME_SIZE = 192;
+  private static readonly PAWN_BODY = { width: 48, height: 64, offsetX: 72, offsetY: 70 };
+  private static readonly SPEED = 250;
+  // The map is top-down, so a jump is a visual hop: the sprite art rises
+  // and lands while the physics body stays on the ground.
+  private static readonly JUMP_HEIGHT = 40;
+  private static readonly JUMP_RISE_MS = 170;
 
   constructor() {
     super('MainScene');
@@ -23,16 +34,18 @@ export default class MainScene extends Phaser.Scene {
     this.load.tilemapTiledJSON('map', 'assets/map/map.json');
     this.load.image('tiles', 'assets/map/spritesheet.png');
 
-    // idle.png: 910x1024, 3 columns x 2 rows. walk.png: 1024x238, 6 in a row.
-    // The sheets don't divide perfectly (910/3, 1024/6), so the last pixel
-    // column of each frame is dropped — invisible at play scale.
-    this.load.spritesheet('player-idle', 'assets/sprites/player-2/idle.png', {
-      frameWidth: 303,
-      frameHeight: 512,
+    // Tiny Swords Pawn: idle has 8 frames, run has 6, all 192x192.
+    this.load.spritesheet('player-idle', 'assets/tiny-swords/pawn-idle.png', {
+      frameWidth: MainScene.PAWN_FRAME_SIZE,
+      frameHeight: MainScene.PAWN_FRAME_SIZE,
     });
-    this.load.spritesheet('player-walk', 'assets/sprites/player-2/walk.png', {
-      frameWidth: 170,
-      frameHeight: 238,
+    this.load.spritesheet('player-walk', 'assets/tiny-swords/pawn-run.png', {
+      frameWidth: MainScene.PAWN_FRAME_SIZE,
+      frameHeight: MainScene.PAWN_FRAME_SIZE,
+    });
+    this.load.spritesheet('player-attack', 'assets/tiny-swords/pawn-attack.png', {
+      frameWidth: MainScene.PAWN_FRAME_SIZE,
+      frameHeight: MainScene.PAWN_FRAME_SIZE,
     });
   }
 
@@ -56,7 +69,7 @@ export default class MainScene extends Phaser.Scene {
     this.anims.create({
       key: 'idle',
       frames: this.anims.generateFrameNumbers('player-idle'),
-      frameRate: 6,
+      frameRate: 8,
       repeat: -1,
     });
     this.anims.create({
@@ -65,15 +78,19 @@ export default class MainScene extends Phaser.Scene {
       frameRate: 10,
       repeat: -1,
     });
+    this.anims.create({
+      key: 'attack',
+      frames: this.anims.generateFrameNumbers('player-attack'),
+      frameRate: 14,
+      repeat: 0,
+    });
 
     this.player = this.physics.add.sprite(map.widthInPixels / 2, map.heightInPixels / 2, 'player-idle', 0);
     this.player.setCollideWorldBounds(true);
-    this.player.on(
-      Phaser.Animations.Events.ANIMATION_START,
-      (anim: Phaser.Animations.Animation) => {
-        this.player.setScale(MainScene.PLAYER_DISPLAY_HEIGHT / anim.frames[0].frame.height);
-      },
-    );
+    // Shrink the physics body from the padded 192x192 frame to the character.
+    const body = MainScene.PAWN_BODY;
+    this.player.body.setSize(body.width, body.height);
+    this.player.body.setOffset(body.offsetX, body.offsetY);
     this.player.play('idle');
 
     for (const layer of this.collisionLayers) {
@@ -84,22 +101,62 @@ export default class MainScene extends Phaser.Scene {
     this.cameras.main.setBounds(0, 0, map.widthInPixels, map.heightInPixels);
     this.cameras.main.startFollow(this.player, true);
     this.cursors = this.input.keyboard!.createCursorKeys();
+    this.attackKey = this.input.keyboard!.addKey(Phaser.Input.Keyboard.KeyCodes.X);
   }
 
   public update() {
-    const speed = 250;
+    // The axe swing commits the player: no moving until it finishes.
+    if (this.isAttacking) return;
 
-    if (this.cursors.left.isDown) {
-      this.player.setVelocityX(-speed);
-      this.player.setFlipX(true);
-      this.player.play('walk', true);
-    } else if (this.cursors.right.isDown) {
-      this.player.setVelocityX(speed);
-      this.player.setFlipX(false);
-      this.player.play('walk', true);
-    } else {
-      this.player.setVelocityX(0);
-      this.player.play('idle', true);
+    if (Phaser.Input.Keyboard.JustDown(this.attackKey)) {
+      this.attack();
+      return;
     }
+    if (Phaser.Input.Keyboard.JustDown(this.cursors.space)) {
+      this.jump();
+    }
+
+    // Four-directional movement, normalised so diagonals aren't faster.
+    const move = new Phaser.Math.Vector2(
+      Number(this.cursors.right.isDown) - Number(this.cursors.left.isDown),
+      Number(this.cursors.down.isDown) - Number(this.cursors.up.isDown),
+    );
+    move.normalize().scale(MainScene.SPEED);
+    this.player.setVelocity(move.x, move.y);
+
+    if (move.x < 0) this.player.setFlipX(true);
+    else if (move.x > 0) this.player.setFlipX(false);
+
+    this.player.play(move.length() > 0 ? 'walk' : 'idle', true);
+  }
+
+  private attack() {
+    this.isAttacking = true;
+    this.player.setVelocity(0, 0);
+    this.player.play('attack');
+    this.player.once(
+      Phaser.Animations.Events.ANIMATION_COMPLETE_KEY + 'attack',
+      () => {
+        this.isAttacking = false;
+        this.player.play('idle');
+      },
+    );
+  }
+
+  private jump() {
+    if (this.isJumping) return;
+    this.isJumping = true;
+    // Raising displayOriginY draws the texture higher while the physics
+    // body (and the player's map position) stays on the ground.
+    this.tweens.add({
+      targets: this.player,
+      displayOriginY: this.player.displayOriginY + MainScene.JUMP_HEIGHT,
+      duration: MainScene.JUMP_RISE_MS,
+      ease: 'Quad.easeOut',
+      yoyo: true,
+      onComplete: () => {
+        this.isJumping = false;
+      },
+    });
   }
 }
